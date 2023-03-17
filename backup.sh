@@ -242,7 +242,7 @@ backup_path() {
       if [[ "$dry_run" != true ]]; then
         args=(
           "${rclone_args[@]}"
-          "--s3-chunk-size" "${chunk_size_mb}Mi"
+          "--s3-chunk-size" "${chunk_size_mb}M"
         )
 
         echo "$files" | tr '\n' '\0' | xargs -0 tar -zcf - -- |

@@ -25,10 +25,13 @@ ${bold}Available options:${normal}
 -p, --path string        Path to the file or directory to backup
 --storage-class string   S3 storage class (default "GLACIER")
 --dry-run                Don't upload files
+--glacier-restore        Restore the files from Glacier in S3 (run before --restore)
+--restore                Restore the files from S3 to the backup path
 
 If the BACKUP_PATH is a directory:
 
 --max-size int           Maximum expected size of a single archive in GiB, used to calculate number of transfer chunks (default 1024 - 1 TiB)
+--aes-password password  Password for aes encryption
 --split-depth int        Directory level to create separate archive files (default 0)
 
 ${bold}Split depth:${normal}
@@ -59,7 +62,11 @@ main() {
   )
 
   if [[ -f "$root_path" ]]; then
-    backup_file "$root_path" "$(basename "$root_path")"
+    echo "Backup of single files is not supported"
+  elif [[ "$glacier_restore" == true ]]; then
+    run_glacier_restore
+  elif [[ "$restore" == true ]]; then
+    restore_backup "$root_path"
   elif [[ "$split_depth" -eq 0 ]]; then
     backup_path "$root_path" "$(basename "$root_path")"
   else
@@ -72,6 +79,8 @@ parse_params() {
   max_size_gb=1024
   storage_class="GLACIER"
   dry_run=false
+  restore=false
+  glacier_restore=false
 
   while :; do
     case "${1-}" in
@@ -97,10 +106,16 @@ parse_params() {
       split_depth="${2-}"
       shift
       ;;
+    --aes-password)
+      aespassword="${2-}"
+      shift
+      ;;
     --storage-class)
       storage_class="${2-}"
       shift
       ;;
+    --restore) restore=true ;;
+    --glacier-restore) glacier_restore=true ;;
     --dry-run) dry_run=true ;;
     -?*) die "Unknown option: $1" ;;
     *) break ;;
@@ -111,6 +126,7 @@ parse_params() {
   [[ -z "${bucket-}" ]] && die "Missing required parameter: bucket"
   [[ -z "${backup_name-}" ]] && die "Missing required parameter: name"
   [[ -z "${root_path-}" ]] && die "Missing required parameter: path"
+  [[ -z "${aespassword-}" ]] && die "Missing required parameter: aes-password"
 
   return 0
 }
@@ -126,19 +142,47 @@ die() {
   exit "$code"
 }
 
+run_glacier_restore() {
+    files=`rclone lsf backup:$bucket/$backup_name/ | grep -E 'tar.gz.aes$'`
+    echo -e "Trying to restore the following files: \n$files\n"
+
+    for f in $files
+    do
+        echo "Restoring $f from glacier..."
+        rclone backend restore s3:$bucket/$backup_name/$f -o lifetime=2
+    done
+    echo "Done. Restore operation usually take 3-5 hours."
+}
+
 # Arguments:
-# - path - absolute path to backup
-# - name - backup file name
-backup_file() {
-  local path=$1
-  local name=$2
+# - path - absolute path to folder for restored backup
+restore_backup() {
+    local path=$1
+    cd "$path" || die "Can't access $path"
+    restorefolder=restore_`date +"%Y-%m-%d_%H-%M-%S"`
+    mkdir $restorefolder
+    cd $restorefolder
 
-  msg "⬆️ Uploading file $name"
+    files=`rclone lsf backup:$bucket/$backup_name/ | grep -E 'tar.gz.aes$'`
+    echo -e "Trying to restore the following files: \n$files\n"
 
-  args=("${rclone_args[@]}" "--checksum")
-  [[ "$dry_run" = true ]] && args+=("--dry-run")
+    for f in $files
+    do
 
-  rclone copy "${args[@]}" "$path" "backup:$bucket/$backup_name"
+        # tmp debug
+        if [[ $f != "testfolder1.tar.gz.aes" ]]; then
+            continue
+        fi
+
+        echo "Downloading $f locally..."
+        rclone copy backup:$bucket/$backup_name/$f .
+        echo "Decrypting $f ..."
+        openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:$aespassword -in $f -out ${f%.aes} && rm $f
+        echo "Unpacking ${f%.aes} to ${f%.tar.gz.aes} ..."
+        mkdir ${f%.tar.gz.aes}
+        tar xf ${f%.aes} -C ${f%.tar.gz.aes} && rm ${f%.aes}
+    done
+
 }
 
 # Arguments:
@@ -154,7 +198,7 @@ backup_path() {
     local archive_name files hash s3_hash
 
     path=$(echo "$path" | sed -E 's#(/(\./)+)|(/\.$)#/#g' | sed 's|/$||')     # remove /./ and trailing /
-    archive_name=$(echo "$backup_name/$name.tar.gz" | sed -E 's|/(\./)+|/|g') # remove /./
+    archive_name=$(echo "$backup_name/$name.tar.gz.aes" | sed -E 's|/(\./)+|/|g') # remove /./
 
     cd "$path" || die "Can't access $path"
 
@@ -202,6 +246,7 @@ backup_path() {
         )
 
         echo "$files" | tr '\n' '\0' | xargs -0 tar -zcf - -- |
+          openssl enc -aes-256-cbc -pbkdf2 -pass pass:$aespassword |
           rclone rcat "${args[@]}" "backup:$bucket/$archive_name"
 
         echo "$hash" | rclone rcat --s3-no-check-bucket "backup:$bucket/$archive_name.md5"

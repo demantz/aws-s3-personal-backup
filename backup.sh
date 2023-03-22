@@ -57,7 +57,7 @@ main() {
   rclone_args=(
     "-P"
     "--s3-storage-class" "$storage_class"
-    "--s3-upload-concurrency" 8
+    "--s3-upload-concurrency" 1
     "--s3-no-check-bucket"
   )
 

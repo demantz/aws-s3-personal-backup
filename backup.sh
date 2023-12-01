@@ -143,15 +143,12 @@ die() {
 }
 
 run_glacier_restore() {
-    files=`rclone lsf backup:$bucket/$backup_name/ | grep -E 'tar.gz.aes$'`
+    files=`rclone lsf backup:$bucket/$backup_name/ --recursive --files-only --include '*.tar.gz.aes'`
     echo -e "Trying to restore the following files: \n$files\n"
 
-    for f in $files
-    do
-        echo "Restoring $f from glacier..."
-        rclone backend restore s3:$bucket/$backup_name/$f -o lifetime=2
-    done
+    rclone backend restore --include '*.tar.gz.aes' backup:$bucket/$backup_name/ -o priority=Standard -o lifetime=2
     echo "Done. Restore operation usually take 3-5 hours."
+    echo "Check status with 'rclone backend restore-status backup:$bucket/$backup_name/'"
 }
 
 # Arguments:
@@ -163,24 +160,40 @@ restore_backup() {
     mkdir $restorefolder
     cd $restorefolder
 
-    files=`rclone lsf backup:$bucket/$backup_name/ | grep -E 'tar.gz.aes$'`
+    files=`rclone lsf --include '*.tar.gz.aes' --files-only backup:$bucket/$backup_name/ --recursive`
     echo -e "Trying to restore the following files: \n$files\n"
 
     for f in $files
     do
 
-        # tmp debug
-        if [[ $f != "testfolder1.tar.gz.aes" ]]; then
-            continue
-        fi
+        relative_path=`dirname $f`
+        filename=${f##*/}
+
+        mkdir -p $relative_path
+        cd $relative_path
 
         echo "Downloading $f locally..."
         rclone copy backup:$bucket/$backup_name/$f .
-        echo "Decrypting $f ..."
-        openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:$aespassword -in $f -out ${f%.aes} && rm $f
-        echo "Unpacking ${f%.aes} to ${f%.tar.gz.aes} ..."
-        mkdir ${f%.tar.gz.aes}
-        tar xf ${f%.aes} -C ${f%.tar.gz.aes} && rm ${f%.aes}
+        echo "Decrypting $filename ..."
+        openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:$aespassword -in $filename -out ${filename%.aes}
+        if [ $? -ne 0 ]; then
+            echo "Error: Decrytion of $f failed. aborting"
+            exit 1
+        fi
+        rm $filename
+        echo "Unpacking ${filename%.aes} to ${filename%.tar.gz.aes} ..."
+        target_dir=${filename%.tar.gz.aes}
+        if [ "$target_dir" = "_files" ]; then
+            target_dir="."
+        else
+            mkdir $target_dir
+        fi
+        tar xf ${filename%.aes} -C $target_dir && rm ${filename%.aes}
+        if [ $? -ne 0 ]; then
+            echo "Error: Unpacking of $f failed. aborting"
+            exit 1
+        fi
+        cd $path/$restorefolder
     done
 
 }

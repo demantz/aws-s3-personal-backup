@@ -217,7 +217,7 @@ backup_path() {
 
     if [[ "$files_only" == true ]]; then
       msg "🔍 Listing files in \"$path\"..."
-      files=$(find . \( -type f -o -type l \) -maxdepth 1 | sed 's/^\.\///g')
+      files=$(find . -maxdepth 1 \( -type f -o -type l \) | sed 's/^\.\///g')
     else
       msg "🔍 Listing all files under \"$path\"..."
       files=$(find . \( -type f -o -type l \) | sed 's/^\.\///g')

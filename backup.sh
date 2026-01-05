@@ -217,10 +217,10 @@ backup_path() {
 
     if [[ "$files_only" == true ]]; then
       msg "🔍 Listing files in \"$path\"..."
-      files=$(find . -type f -maxdepth 1 | sed 's/^\.\///g')
+      files=$(find . \( -type f -o -type l \) -maxdepth 1 | sed 's/^\.\///g')
     else
       msg "🔍 Listing all files under \"$path\"..."
-      files=$(find . -type f | sed 's/^\.\///g')
+      files=$(find . \( -type f -o -type l \) | sed 's/^\.\///g')
     fi
 
     # sort to maintain always the same order for hash

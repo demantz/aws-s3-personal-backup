@@ -22,9 +22,11 @@ ${bold}Available options:${normal}
 -v, --verbose            Print script debug info
 -b, --bucket string      S3 bucket name
 -n, --name string        Backup name, acts as a S3 path prefix
+-s, --subfolder string   Backup subfolder (relative to backup name folder)
 -p, --path string        Path to the file or directory to backup
 --storage-class string   S3 storage class (default "GLACIER")
 --dry-run                Don't upload files
+--verbose                Show executed commands
 --glacier-restore        Restore the files from Glacier in S3 (run before --restore)
 --restore                Restore the files from S3 to the backup path
 
@@ -45,6 +47,9 @@ EOF
 }
 
 main() {
+  if [[ "$verbose" == true ]]; then
+    set -x
+  fi
   root_path=$(
     cd "$(dirname "$root_path")"
     pwd -P
@@ -67,6 +72,13 @@ main() {
     run_glacier_restore
   elif [[ "$restore" == true ]]; then
     restore_backup "$root_path"
+    status=$?
+    echo "restore_backup exited with status: $status"
+    if [ $status -ne 0 ]; then
+        echo "Restore failed!"
+    else
+        echo "Restore successful!"
+    fi
   elif [[ "$split_depth" -eq 0 ]]; then
     backup_path "$root_path" "$(basename "$root_path")"
   else
@@ -81,6 +93,7 @@ parse_params() {
   dry_run=false
   restore=false
   glacier_restore=false
+  verbose=false
 
   while :; do
     case "${1-}" in
@@ -92,6 +105,10 @@ parse_params() {
       ;;
     -n | --name)
       backup_name="${2-}"
+      shift
+      ;;
+    -s | --subfolder)
+      subfolder="${2-}"
       shift
       ;;
     -p | --path)
@@ -117,6 +134,7 @@ parse_params() {
     --restore) restore=true ;;
     --glacier-restore) glacier_restore=true ;;
     --dry-run) dry_run=true ;;
+    --verbose) verbose=true ;;
     -?*) die "Unknown option: $1" ;;
     *) break ;;
     esac
@@ -143,59 +161,88 @@ die() {
 }
 
 run_glacier_restore() {
-    files=`rclone lsf backup:$bucket/$backup_name/ --recursive --files-only --include '*.tar.gz.aes'`
+    fullpath="$bucket/$backup_name/$subfolder"
+    files=`rclone lsf backup:$fullpath --recursive --files-only --include '*.tar.gz.aes'`
     echo -e "Trying to restore the following files: \n$files\n"
 
-    rclone backend restore --include '*.tar.gz.aes' backup:$bucket/$backup_name/ -o priority=Standard -o lifetime=2
+    read -p "Press enter to continue"
+
+    rclone backend restore --include '*.tar.gz.aes' backup:$fullpath -o priority=Standard -o lifetime=2
     echo "Done. Restore operation usually take 3-5 hours."
-    echo "Check status with 'rclone backend restore-status backup:$bucket/$backup_name/'"
+    echo "Check status with 'rclone backend restore-status backup:$fullpath'"
 }
 
 # Arguments:
 # - path - absolute path to folder for restored backup
 restore_backup() {
-    local path=$1
-    cd "$path" || die "Can't access $path"
-    restorefolder=restore_`date +"%Y-%m-%d_%H-%M-%S"`
-    mkdir $restorefolder
-    cd $restorefolder
+    local path="$1"
 
-    files=`rclone lsf --include '*.tar.gz.aes' --files-only backup:$bucket/$backup_name/ --recursive`
-    echo -e "Trying to restore the following files: \n$files\n"
+    cd "$path" || { echo "Can't access $path"; return 1; }
 
-    for f in $files
-    do
+    local restorefolder
+    restorefolder="restore_$(date +"%Y-%m-%d_%H-%M-%S")"
 
-        relative_path=`dirname $f`
-        filename=${f##*/}
+    mkdir -p "$restorefolder" || return 1
+    cd "$restorefolder" || return 1
 
-        mkdir -p $relative_path
-        cd $relative_path
+    local fullpath="$bucket/$backup_name/$subfolder"
+
+    echo "Fetching file list..."
+    rclone lsf --include '*.tar.gz.aes' --files-only --recursive "backup:$fullpath" | {
+        echo -e "Trying to restore the following files:\n"
+        cat
+        echo
+    }
+
+    read -r -p "Press enter to continue"
+
+    # Process files safely line-by-line
+    rclone lsf --include '*.tar.gz.aes' --files-only --recursive "backup:$fullpath" |
+    while IFS= read -r f; do
+        echo "Processing: $f"
+
+        local relative_path filename target_dir
+        relative_path=$(dirname "$f")
+        filename="${f##*/}"
+
+        mkdir -p "$relative_path" || exit 1
+        cd "$relative_path" || exit 1
 
         echo "Downloading $f locally..."
-        rclone copy backup:$bucket/$backup_name/$f .
-        echo "Decrypting $filename ..."
-        openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:$aespassword -in $filename -out ${filename%.aes}
-        if [ $? -ne 0 ]; then
-            echo "Error: Decrytion of $f failed. aborting"
+        if ! rclone copy "backup:$fullpath/$f" .; then
+            echo "Error: Download of $f failed. aborting"
             exit 1
         fi
-        rm $filename
-        echo "Unpacking ${filename%.aes} to ${filename%.tar.gz.aes} ..."
-        target_dir=${filename%.tar.gz.aes}
+
+        echo "Decrypting $filename ..."
+        if ! openssl enc -d -aes-256-cbc -pbkdf2 \
+            -pass pass:"$aespassword" \
+            -in "$filename" -out "${filename%.aes}"; then
+            echo "Error: Decryption of $f failed. aborting"
+            exit 1
+        fi
+
+        rm -f "$filename"
+
+        echo "Unpacking ${filename%.aes} ..."
+        target_dir="${filename%.tar.gz.aes}"
+
         if [ "$target_dir" = "_files" ]; then
             target_dir="."
         else
-            mkdir $target_dir
+            mkdir -p "$target_dir" || exit 1
         fi
-        tar xf ${filename%.aes} -C $target_dir && rm ${filename%.aes}
-        if [ $? -ne 0 ]; then
+
+        if ! tar xf "${filename%.aes}" -C "$target_dir"; then
             echo "Error: Unpacking of $f failed. aborting"
             exit 1
         fi
-        cd $path/$restorefolder
-    done
 
+        rm -f "${filename%.aes}"
+
+        # Go back to restore root safely
+        cd "$path/$restorefolder" || exit 1
+    done
 }
 
 # Arguments:
